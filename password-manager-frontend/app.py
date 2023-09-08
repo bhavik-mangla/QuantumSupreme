@@ -10,11 +10,6 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-users = {
-
-    "user1": "password1",
-    "user2": "password2",
-}
 
 # Initialize the SQLite database
 
@@ -30,10 +25,26 @@ def register():
     username = data.get('username')
     password = data.get('password')
 
-    users[username] = password
-    print(users)
     # Generate a key pair for the user
     private_key, public_key = generate_kyber_keys(2)
+    seed = os.urandom(KYBER_SYM_BYTES)
+    seed = bytearray([x & 0xFF for x in seed])
+
+    # Convert password to byte array using UTF-8 encoding
+    password_bytes = password.encode('utf-8')
+    padded_password = add_padding(password_bytes)
+
+    # Encrypt the password and store it in the database
+    cipher = encrypt(padded_password, public_key, seed, 2)
+    cipher_bytes = bytearray([x & 0xFF for x in cipher])
+
+    connection = sqlite3.connect('password_manager.db')
+    cursor = connection.cursor()
+    cursor.execute('INSERT INTO users (username, encrypted_password, public_key) VALUES (?, ?, ?)',
+                   (username, cipher_bytes, json.dumps(public_key)))
+    connection.commit()
+    connection.close()
+
     try:
         with open('private_key.txt', 'r') as f:
             data = json.load(f)
@@ -46,25 +57,6 @@ def register():
     with open('private_key.txt', 'w') as f:
         f.write(json.dumps(data, indent=4))
 
-    # Serialize the public_key to JSON
-    public_key_json = json.dumps(public_key)
-
-    # Store the serialized public_key and username in the database
-    connection = sqlite3.connect('password_manager.db')
-    cursor = connection.cursor()
-    cursor.execute(
-        'INSERT INTO users (username, public_key) VALUES (?, ?)', (username, public_key_json))
-    connection.commit()
-    connection.close()
-
-    # Retrieve the user's public key from the database
-    connection = sqlite3.connect('password_manager.db')
-    cursor = connection.cursor()
-    cursor.execute(
-        'SELECT public_key FROM users WHERE username = ?', (username,))
-    public_key = cursor.fetchone()[0]
-    connection.close()
-
     # You can customize the response message
     return jsonify(message="Registration successful")
 
@@ -76,9 +68,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE,
+            encrypted_password BLOB,
             public_key BLOB
         )
     ''')
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS passwords (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,19 +94,44 @@ def login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
+
     # Check if the username exists in your user database
-    if username in users:
-        # Check if the provided password matches the stored password
-        if users[username] == password:
-            # Authentication successful
-            print("Login successful")
-            return jsonify({"message": "Login successful"})
-        else:
-            # Incorrect password
-            return jsonify({"message": "Incorrect password"}), 401
-    else:
+    connection = sqlite3.connect('password_manager.db')
+    cursor = connection.cursor()
+    cursor.execute(
+        'SELECT username FROM users WHERE username = ?', (username,))
+    user = cursor.fetchone()
+    connection.close()
+
+    if user is None:
         # User not found
         return jsonify({"message": "User not found"}), 404
+
+    # Retrieve the user's private key from the local file
+    with open('private_key.txt', 'r') as f:
+        private_key = json.loads(f.read())[username]
+
+    # Retrieve the user's encrypted password from the database
+    connection = sqlite3.connect('password_manager.db')
+    cursor = connection.cursor()
+    cursor.execute(
+        'SELECT encrypted_password FROM users WHERE username = ?', (username,))
+    encrypted_password = cursor.fetchone()[0]
+    connection.close()
+
+    # Decrypt the password
+    pwd = decrypt(encrypted_password, private_key, 2)
+    original_password = remove_padding(pwd)
+    original_password = bytes(original_password).decode('utf-8')
+
+    # Compare the passwords
+
+    if original_password == password:
+        print("Login successful")
+        return jsonify({"message": "Login successful"})
+    else:
+        print("Incorrect password")
+        return jsonify({"message": "Incorrect password"}), 401
 
 
 def add_padding(data, block_size=32):
@@ -130,6 +149,23 @@ def remove_padding(data):
         if all(x == padding for x in data[-padding:]):
             return data[:-padding]
     return data  # No padding or incorrect padding
+
+
+@app.route('/delete-password', methods=['POST'])
+def delete_password():
+    data = request.get_json()
+    username = data.get('username')
+    sitename = data.get('sitename')
+
+    # Delete the password from the database
+    connection = sqlite3.connect('password_manager.db')
+    cursor = connection.cursor()
+    cursor.execute('DELETE FROM passwords WHERE username = ? AND sitename = ?',
+                   (username, sitename))
+    connection.commit()
+    connection.close()
+
+    return jsonify(message="Password deleted successfully")
 
 
 @app.route('/store-password', methods=['POST'])
@@ -198,6 +234,48 @@ def get_passwords():
             original_password).decode('utf-8')})
 
     return jsonify(message="Passwords retrieved successfully", passwords=passwords)
+
+
+@app.route('/update-password', methods=['POST'])
+def update_password():
+    data = request.get_json()
+    username = data.get('username')
+    sitename = data.get('sitename')
+
+    new_password = data.get('new_password')
+
+    # Generate a random seed of the correct length
+    seed = os.urandom(KYBER_SYM_BYTES)
+    seed = bytearray([x & 0xFF for x in seed])
+
+    # Retrieve the user's public key from the database
+    connection = sqlite3.connect('password_manager.db')
+    cursor = connection.cursor()
+    cursor.execute(
+        'SELECT public_key FROM users WHERE username = ?', (username,))
+    public_key = cursor.fetchone()[0]
+    connection.close()
+
+    # Convert public key from JSON to bytes
+    public_key = json.loads(public_key)
+
+    # Convert password to byte array using UTF-8 encoding
+    password_bytes = new_password.encode('utf-8')
+    padded_password = add_padding(password_bytes)
+
+    # Encrypt the password and store it in the database
+    cipher = encrypt(padded_password, public_key, seed, 2)
+    cipher_bytes = bytearray([x & 0xFF for x in cipher])
+
+    # Update the password in the database
+    connection = sqlite3.connect('password_manager.db')
+    cursor = connection.cursor()
+    cursor.execute('UPDATE passwords SET encrypted_password = ? WHERE username = ? AND sitename = ?',
+                   (cipher_bytes, username, sitename))
+    connection.commit()
+    connection.close()
+
+    return jsonify(message="Password updated successfully")
 
 
 if __name__ == '__main__':
